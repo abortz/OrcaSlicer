@@ -2653,6 +2653,14 @@ void TabPrint::build()
         optgroup->append_single_option_line("spiral_mode_max_xy_smoothing", "others_settings_special_mode#max-xy-smoothing");
         optgroup->append_single_option_line("spiral_starting_flow_ratio", "others_settings_special_mode#spiral-starting-flow-ratio");
         optgroup->append_single_option_line("spiral_finishing_flow_ratio", "others_settings_special_mode#spiral-finishing-flow-ratio");
+        optgroup->append_single_option_line("bridged_vase_mode");
+        optgroup->append_single_option_line("bridged_vase_angle");
+        optgroup->append_single_option_line("bridged_vase_grid_spacing_1");
+        optgroup->append_single_option_line("bridged_vase_grid_angle_1");
+        optgroup->append_single_option_line("bridged_vase_grid_spacing_2");
+        optgroup->append_single_option_line("bridged_vase_grid_angle_2");
+        optgroup->append_single_option_line("bridged_vase_interlocking_layers");
+        optgroup->append_single_option_line("bridged_vase_first_offset");
 
         optgroup->append_single_option_line("timelapse_type", "others_settings_special_mode#timelapse");
         optgroup->append_single_option_line("enable_wrapping_detection");

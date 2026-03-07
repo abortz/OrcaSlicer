@@ -5390,6 +5390,87 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionFloat(0));
     def->mode = comAdvanced;
 
+    // Bridged vase mode settings
+    def = this->add("bridged_vase_mode", coBool);
+    def->label = L("Bridged vase");
+    def->tooltip = L("When enabled with spiral vase mode, periodically inserts out-and-back bridge "
+                     "detours across the interior of the single-wall perimeter. Bridges from alternating "
+                     "sides interlock vertically, creating a reinforced vase structure.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("bridged_vase_angle", coFloat);
+    def->label = L("Bridge angle");
+    def->tooltip = L("Absolute angle (in degrees) for the bridge direction. 0 = East (positive X), "
+                     "90 = North (positive Y). All bridges on all layers use this fixed angle.");
+    def->sidetext = L("\u00B0");
+    def->min = 0;
+    def->max = 360;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("bridged_vase_grid_spacing_1", coFloat);
+    def->label = L("Grid spacing 1");
+    def->tooltip = L("Magnitude of the first lattice basis vector in the bridge grid plane "
+                     "(perpendicular-position vs Z). Controls the distance between repeating "
+                     "bridge positions along the first grid axis.");
+    def->sidetext = L("mm");
+    def->min = 1;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(20));
+
+    def = this->add("bridged_vase_grid_angle_1", coFloat);
+    def->label = L("Grid angle 1");
+    def->tooltip = L("Angle of the first lattice basis vector in the bridge grid plane. "
+                     "0 degrees means purely horizontal (bridges repeat at the same Z across "
+                     "different perimeter positions). 90 degrees means purely vertical.");
+    def->sidetext = L("\u00B0");
+    def->min = -90;
+    def->max = 90;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("bridged_vase_grid_spacing_2", coFloat);
+    def->label = L("Grid spacing 2");
+    def->tooltip = L("Magnitude of the second lattice basis vector in the bridge grid plane.");
+    def->sidetext = L("mm");
+    def->min = 1;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(10));
+
+    def = this->add("bridged_vase_grid_angle_2", coFloat);
+    def->label = L("Grid angle 2");
+    def->tooltip = L("Angle of the second lattice basis vector in the bridge grid plane. "
+                     "For a rectangular grid use 90 degrees. For a triangular grid use "
+                     "approximately 60 degrees.");
+    def->sidetext = L("\u00B0");
+    def->min = -90;
+    def->max = 90;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(90));
+
+    def = this->add("bridged_vase_interlocking_layers", coInt);
+    def->label = L("Interlocking layers");
+    def->tooltip = L("Number of layers in each bridge group. Bridges from alternating sides "
+                     "stack up for this many layers before the next gap. The first layer of each "
+                     "group is a short landing zone (one line width) for printability.");
+    def->min = 2;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(4));
+
+    def = this->add("bridged_vase_first_offset", coFloat);
+    def->label = L("First bridge offset");
+    def->tooltip = L("Distance along the perimeter from the start point to the first bridge "
+                     "insertion point.");
+    def->sidetext = L("mm");
+    def->min = 0;
+    def->max = 10000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5));
+
     def = this->add("timelapse_type", coEnum);
     def->label = L("Timelapse");
     def->tooltip = L("If smooth or traditional mode is selected, a timelapse video will be generated for each print. "

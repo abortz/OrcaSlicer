@@ -15,6 +15,7 @@
 #include "Line.hpp"
 #include <cmath>
 #include <cassert>
+#include <limits>
 #include <unordered_set>
 #include <thread>
 #include "libslic3r/AABBTreeLines.hpp"
@@ -97,6 +98,383 @@ static bool detect_steep_overhang(const PrintRegionConfig *config,
     return false;
 }
 
+// ==================== Bridged Vase Mode ====================
+
+// A bridge position on a given layer, computed from the 2D lattice.
+struct BridgePosition {
+    double perp_position;    // horizontal position along perp axis (scaled coords)
+    bool   is_landing_layer; // true if first layer of its group
+    int    layer_parity;     // 0 or 1, alternates every layer within group
+};
+
+// Compute all bridge positions for a given layer_z using a 2D lattice
+// defined by two basis vectors in the (perpendicular_position_mm, Z_mm) plane.
+static std::vector<BridgePosition> compute_bridge_positions(
+    const PrintConfig &config,
+    double             layer_z,
+    double             layer_height,
+    double             min_proj_sc,   // min perp extent of perimeter (scaled)
+    double             max_proj_sc,   // max perp extent of perimeter (scaled)
+    double             first_off_mm,
+    double             spacing_mm)
+{
+    std::vector<BridgePosition> positions;
+
+    int    interlock    = config.bridged_vase_interlocking_layers.value;
+    double group_height = interlock * layer_height; // mm
+
+    double s1 = config.bridged_vase_grid_spacing_1.value;
+    double a1 = config.bridged_vase_grid_angle_1.value * M_PI / 180.0;
+    double s2 = config.bridged_vase_grid_spacing_2.value;
+    double a2 = config.bridged_vase_grid_angle_2.value * M_PI / 180.0;
+
+    // Basis vectors in (perp_mm, Z_mm)
+    double Ah = s1 * cos(a1);
+    double Av = s1 * sin(a1);
+    double Bh = s2 * cos(a2);
+    double Bv = s2 * sin(a2);
+
+    // Check for degenerate lattice (parallel basis vectors)
+    double det = Ah * Bv - Av * Bh;
+    if (std::abs(det) < 1e-6) {
+        // Degenerate: fall back to single-vector grid using A only
+        // Treat as if B = (0, group_height) to get vertical stacking
+        Bh = 0;
+        Bv = group_height;
+        det = Ah * Bv - Av * Bh;
+        if (std::abs(det) < 1e-6)
+            return positions;
+    }
+
+    // Convert perp extents to mm for lattice math
+    double min_proj_mm = unscale<double>(min_proj_sc);
+    double max_proj_mm = unscale<double>(max_proj_sc);
+    double margin_mm   = spacing_mm;
+
+    // Determine j bounds.
+    // We need: base_z = i*Av + j*Bv in [layer_z - group_height, layer_z)
+    // and:     perp = first_off + i*Ah + j*Bh in (min_proj_mm + margin, max_proj_mm - margin)
+    // Bound j to a practical range by considering both constraints.
+    double perp_lo = min_proj_mm + margin_mm;
+    double perp_hi = max_proj_mm - margin_mm;
+
+    // Estimate j range from Z constraint (assuming i could be anything, we still
+    // need j*Bv to be roughly in the right Z range when combined with some i*Av)
+    // and from perp constraint. Use a generous bound.
+    int j_min, j_max;
+    {
+        // From Z: need i*Av + j*Bv in [layer_z - group_height, layer_z] for some valid i.
+        // From perp: need first_off + i*Ah + j*Bh in [perp_lo, perp_hi] for some valid i.
+        // Use inverse of the lattice matrix to find approximate bounds.
+        // (i, j) = (1/det) * (Bv, -Bh; -Av, Ah) * (perp - first_off, z)
+        // j = (-Av * (perp - first_off) + Ah * z) / det
+        // Try all four corners of the (perp, z) rectangle.
+        double z_lo = layer_z - group_height;
+        double z_hi = layer_z;
+        double p_lo = perp_lo - first_off_mm;
+        double p_hi = perp_hi - first_off_mm;
+
+        double j_vals[4] = {
+            (-Av * p_lo + Ah * z_lo) / det,
+            (-Av * p_lo + Ah * z_hi) / det,
+            (-Av * p_hi + Ah * z_lo) / det,
+            (-Av * p_hi + Ah * z_hi) / det,
+        };
+        double jf_min = *std::min_element(j_vals, j_vals + 4);
+        double jf_max = *std::max_element(j_vals, j_vals + 4);
+        j_min = (int)std::floor(jf_min) - 1;
+        j_max = (int)std::ceil(jf_max) + 1;
+
+        // Safety cap
+        j_min = std::max(j_min, -10000);
+        j_max = std::min(j_max, 10000);
+    }
+
+    for (int j = j_min; j <= j_max; ++j) {
+        // For this j, find valid i range from Z constraint:
+        // layer_z - group_height <= i*Av + j*Bv < layer_z
+        // => (layer_z - group_height - j*Bv) / Av <= i < (layer_z - j*Bv) / Av  (if Av > 0)
+        double residual_z_lo = layer_z - group_height - j * Bv;
+        double residual_z_hi = layer_z - j * Bv;
+
+        int i_min, i_max;
+        if (std::abs(Av) < 1e-9) {
+            // Av ~ 0: Z constraint doesn't depend on i
+            // Check if j*Bv puts us in range
+            if (residual_z_lo > 0 || residual_z_hi < 0)
+                continue; // j*Bv not in [layer_z - group_height, layer_z)
+            // i is unconstrained by Z; bound by perp only
+            i_min = -10000;
+            i_max = 10000;
+        } else if (Av > 0) {
+            i_min = (int)std::ceil(residual_z_lo / Av - 1e-9);
+            i_max = (int)std::floor(residual_z_hi / Av + 1e-9);
+        } else {
+            // Av < 0: inequality flips
+            i_min = (int)std::ceil(residual_z_hi / Av - 1e-9);
+            i_max = (int)std::floor(residual_z_lo / Av + 1e-9);
+        }
+
+        // Further bound i by perp extent:
+        // perp_lo <= first_off + i*Ah + j*Bh <= perp_hi
+        double perp_base = first_off_mm + j * Bh;
+        if (std::abs(Ah) < 1e-9) {
+            if (perp_base < perp_lo || perp_base > perp_hi)
+                continue;
+        } else {
+            double i_perp_lo = (perp_lo - perp_base) / Ah;
+            double i_perp_hi = (perp_hi - perp_base) / Ah;
+            if (Ah < 0) std::swap(i_perp_lo, i_perp_hi);
+            i_min = std::max(i_min, (int)std::ceil(i_perp_lo - 1e-9));
+            i_max = std::min(i_max, (int)std::floor(i_perp_hi + 1e-9));
+        }
+
+        // Safety cap
+        i_min = std::max(i_min, -10000);
+        i_max = std::min(i_max, 10000);
+
+        for (int i = i_min; i <= i_max; ++i) {
+            double base_z = i * Av + j * Bv;
+            double pos_in_group = layer_z - base_z;
+
+            // Strict check: must be within [0, group_height)
+            if (pos_in_group < -1e-9 || pos_in_group >= group_height + 1e-9)
+                continue;
+
+            int layer_in_group = (int)std::floor(pos_in_group / layer_height);
+            layer_in_group = std::max(0, std::min(layer_in_group, interlock - 1));
+
+            double perp_mm = first_off_mm + i * Ah + j * Bh;
+            if (perp_mm < perp_lo || perp_mm > perp_hi)
+                continue;
+
+            BridgePosition bp;
+            bp.perp_position = scale_(perp_mm);
+            bp.is_landing_layer = (layer_in_group == 0);
+            bp.layer_parity = layer_in_group % 2;
+            positions.push_back(bp);
+        }
+    }
+
+    // Sort by perp_position
+    std::sort(positions.begin(), positions.end(),
+        [](const BridgePosition &a, const BridgePosition &b) {
+            return a.perp_position < b.perp_position;
+        });
+
+    // Deduplicate: remove positions within 2*spacing of each other
+    double dedup_dist = scale_(2.0 * spacing_mm);
+    std::vector<BridgePosition> deduped;
+    for (const auto &bp : positions) {
+        if (!deduped.empty() && (bp.perp_position - deduped.back().perp_position) < dedup_dist)
+            continue;
+        deduped.push_back(bp);
+    }
+
+    return deduped;
+}
+
+// A crossing of a bridge line with a polygon edge.
+struct BridgeCrossing {
+    size_t edge_idx;
+    double t;          // interpolation [0,1] along the edge
+    Vec2d  point;      // intersection point (scaled coords)
+    double dir_proj;   // projection onto bridge direction
+};
+
+static auto cmp_dir_proj = [](const BridgeCrossing &a, const BridgeCrossing &b) { return a.dir_proj < b.dir_proj; };
+
+// Find all crossings of a line at perpendicular position P with the polygon edges.
+static std::vector<BridgeCrossing> find_crossings(
+    const Points &pts, size_t n, const Vec2d &perp, const Vec2d &dir, double P)
+{
+    std::vector<BridgeCrossing> crossings;
+    for (size_t i = 0; i < n; ++i) {
+        Vec2d a = pts[i].cast<double>();
+        Vec2d b = pts[(i + 1) % n].cast<double>();
+        double proj_a = a.dot(perp);
+        double proj_b = b.dot(perp);
+        if ((proj_a < P && P <= proj_b) || (proj_b < P && P <= proj_a)) {
+            double t = (P - proj_a) / (proj_b - proj_a);
+            Vec2d pt = a + t * (b - a);
+            crossings.push_back({i, t, pt, pt.dot(dir)});
+        }
+    }
+    return crossings;
+}
+
+// A complete bridge detour: entry and exit are on the perimeter, far_end is across the interior.
+struct BridgeInsert {
+    BridgeCrossing entry;    // where we leave the perimeter
+    BridgeCrossing exit;     // where we rejoin the perimeter (one line spacing ahead)
+    BridgeCrossing far_end;  // the opposite-side crossing (determines bridge depth)
+    bool           is_landing_layer; // per-bridge: first layer of its group
+};
+
+// Insert out-and-back bridge detours into a perimeter polygon for bridged vase mode.
+// Bridge positions are determined by a 2D lattice in the (perp_position, Z) plane.
+static Polygon insert_vase_bridges(
+    const Polygon      &perimeter,
+    const PrintConfig  &config,
+    double              layer_z,
+    double              layer_height,
+    double              line_spacing)  // spacing between out and back lines (mm, unscaled)
+{
+    double angle_rad = config.bridged_vase_angle.value * M_PI / 180.0;
+
+    Vec2d dir(cos(angle_rad), sin(angle_rad));
+    Vec2d perp(-sin(angle_rad), cos(angle_rad));
+
+    double spacing_sc = scale_(line_spacing);
+
+    // Find the perpendicular extent of the perimeter
+    const Points &pts = perimeter.points;
+    size_t n = pts.size();
+    if (n < 3) return perimeter;
+
+    double min_proj = std::numeric_limits<double>::max();
+    double max_proj = std::numeric_limits<double>::lowest();
+    for (const Point &p : pts) {
+        double proj = p.cast<double>().dot(perp);
+        min_proj = std::min(min_proj, proj);
+        max_proj = std::max(max_proj, proj);
+    }
+
+    // Compute bridge positions from the 2D lattice
+    std::vector<BridgePosition> positions = compute_bridge_positions(
+        config, layer_z, layer_height, min_proj, max_proj,
+        config.bridged_vase_first_offset.value, line_spacing);
+
+    if (positions.empty())
+        return perimeter;
+
+    // For each bridge position P, the bridge occupies two lanes: P and P + spacing_sc.
+    // These lanes are fixed across all layers so that alternating layers interlock.
+    // Entry/exit are determined by polygon traversal order; layer_parity controls
+    // which side (min-dir or max-dir) the bridge starts from.
+    std::vector<BridgeInsert> bridges;
+    for (const BridgePosition &bp : positions) {
+        double P  = bp.perp_position;
+        double P2 = P + spacing_sc;  // second lane, always in positive perp direction
+
+        // Find crossings at both lane positions
+        auto crossings_P  = find_crossings(pts, n, perp, dir, P);
+        auto crossings_P2 = find_crossings(pts, n, perp, dir, P2);
+        if (crossings_P.size() < 2 || crossings_P2.size() < 2)
+            continue;
+
+        // Find min/max dir_proj crossings at P (for near/far side selection)
+        auto it_min_P = std::min_element(crossings_P.begin(), crossings_P.end(),
+            cmp_dir_proj);
+        auto it_max_P = std::max_element(crossings_P.begin(), crossings_P.end(),
+            cmp_dir_proj);
+
+        // Near/far side at P based on per-bridge layer parity
+        const BridgeCrossing &near_P = (bp.layer_parity == 0) ? *it_min_P : *it_max_P;
+        const BridgeCrossing &far_P  = (bp.layer_parity == 0) ? *it_max_P : *it_min_P;
+
+        // Find min/max dir_proj crossings at P2
+        auto it_min_P2 = std::min_element(crossings_P2.begin(), crossings_P2.end(),
+            cmp_dir_proj);
+        auto it_max_P2 = std::max_element(crossings_P2.begin(), crossings_P2.end(),
+            cmp_dir_proj);
+
+        const BridgeCrossing &near_P2 = (bp.layer_parity == 0) ? *it_min_P2 : *it_max_P2;
+        const BridgeCrossing &far_P2  = (bp.layer_parity == 0) ? *it_max_P2 : *it_min_P2;
+
+        // Determine polygon traversal order of the two near-side crossings.
+        // The one encountered first is the entry, the other is the exit.
+        bool P_first = (near_P.edge_idx < near_P2.edge_idx) ||
+                       (near_P.edge_idx == near_P2.edge_idx && near_P.t < near_P2.t);
+
+        // Use the far crossing from the same lane as the entry so the bridge
+        // goes straight across, not at a slight angle.
+        const BridgeCrossing &entry_c = P_first ? near_P  : near_P2;
+        const BridgeCrossing &exit_c  = P_first ? near_P2 : near_P;
+        const BridgeCrossing &far_c   = P_first ? far_P   : far_P2;
+
+        bridges.push_back({entry_c, exit_c, far_c, bp.is_landing_layer});
+    }
+
+    if (bridges.empty())
+        return perimeter;
+
+    // Sort bridges by polygon traversal order of entry (edge index, then t)
+    std::sort(bridges.begin(), bridges.end(), [](const BridgeInsert &a, const BridgeInsert &b) {
+        if (a.entry.edge_idx != b.entry.edge_idx)
+            return a.entry.edge_idx < b.entry.edge_idx;
+        return a.entry.t < b.entry.t;
+    });
+
+    // Rebuild polygon with bridge detours spliced in.
+    // For each bridge, we emit: entry -> far1 -> far2 -> exit
+    // and skip all original perimeter vertices between entry and exit.
+    Points result;
+    result.reserve(n + bridges.size() * 4);
+    size_t bi = 0;
+    bool skipping = false;
+    size_t skip_until_edge = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        if (skipping) {
+            if (i == skip_until_edge)
+                skipping = false;
+            continue;
+        }
+
+        result.push_back(pts[i]);
+
+        while (bi < bridges.size() && bridges[bi].entry.edge_idx == i) {
+            const BridgeInsert &br = bridges[bi];
+
+            Vec2d entry = br.entry.point;
+            Vec2d far_perim = br.far_end.point;
+            Vec2d exit_pt = br.exit.point;
+
+            Vec2d delta = far_perim - entry;
+            double full_len = delta.norm();
+            double bridge_len = full_len - spacing_sc;
+
+            if (br.is_landing_layer) {
+                bridge_len = std::min(bridge_len, spacing_sc);
+            }
+
+            if (bridge_len <= 0) {
+                ++bi;
+                continue;
+            }
+
+            double entry_perp_pos = entry.dot(perp);
+            double exit_perp_pos  = exit_pt.dot(perp);
+            double shift_sign = (exit_perp_pos > entry_perp_pos) ? 1.0 : -1.0;
+            Vec2d shift = perp * (shift_sign * spacing_sc);
+
+            Vec2d far1 = entry + delta * (bridge_len / full_len);
+            Vec2d far2 = far1 + shift;
+
+            result.push_back(Point(entry));
+            result.push_back(Point(far1));
+            result.push_back(Point(far2));
+            result.push_back(Point(exit_pt));
+
+            if (br.exit.edge_idx != br.entry.edge_idx) {
+                skipping = true;
+                skip_until_edge = br.exit.edge_idx;
+            }
+
+            ++bi;
+        }
+    }
+
+    Polygon result_poly(std::move(result));
+    result_poly.remove_duplicate_points();
+    if (result_poly.points.size() > 1 && result_poly.points.front() == result_poly.points.back())
+        result_poly.points.pop_back();
+    return result_poly;
+}
+
+// ==================== End Bridged Vase Mode ====================
+
 static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perimeter_generator, const PerimeterGeneratorLoops &loops, ThickPolylines &thin_walls,
     bool &steep_overhang_contour, bool &steep_overhang_hole)
 {
@@ -148,7 +526,17 @@ static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perime
         }
 
         // Apply fuzzy skin if it is enabled for at least some part of the polygon.
-        const Polygon polygon = apply_fuzzy_skin(loop.polygon, perimeter_generator, loop.depth, loop.is_contour);
+        Polygon polygon = apply_fuzzy_skin(loop.polygon, perimeter_generator, loop.depth, loop.is_contour);
+
+        // Bridged vase mode: insert out-and-back bridge detours into the external contour.
+        if (perimeter_generator.m_bridged_vase && loop.is_external() && loop.is_contour) {
+            polygon = insert_vase_bridges(
+                polygon,
+                *perimeter_generator.print_config,
+                perimeter_generator.slice_z,
+                perimeter_generator.layer_height,
+                perimeter_generator.ext_perimeter_flow.spacing());
+        }
 
         ExtrusionPaths paths;
         if (perimeter_generator.config->detect_overhang_wall && perimeter_generator.layer_id > perimeter_generator.object_config->raft_layers) {

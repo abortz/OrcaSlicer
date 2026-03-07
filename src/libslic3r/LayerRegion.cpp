@@ -82,6 +82,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         (this->layer()->id() >= size_t(region_config.bottom_shell_layers.value) &&
          this->layer()->print_z >= region_config.bottom_shell_thickness - EPSILON);
 
+    bool bridged_vase_mode = spiral_mode && print_config.bridged_vase_mode;
+
     PerimeterGenerator g(
         // input:
         &slices,
@@ -93,7 +95,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         &this->layer()->object()->config(),
         &print_config,
         spiral_mode,
-        
+        bridged_vase_mode,
+
         // output:
         &this->perimeters,
         &this->thin_fills,

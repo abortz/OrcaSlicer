@@ -391,6 +391,16 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         }
         else if (opt_key == "z_hop_types") {
             osteps.emplace_back(posDetectOverhangsForLift);
+        } else if (
+               opt_key == "bridged_vase_mode"
+            || opt_key == "bridged_vase_angle"
+            || opt_key == "bridged_vase_grid_spacing_1"
+            || opt_key == "bridged_vase_grid_angle_1"
+            || opt_key == "bridged_vase_grid_spacing_2"
+            || opt_key == "bridged_vase_grid_angle_2"
+            || opt_key == "bridged_vase_interlocking_layers"
+            || opt_key == "bridged_vase_first_offset") {
+            osteps.emplace_back(posPerimeters);
         } else {
             // for legacy, if we can't handle this option let's invalidate all steps
             //FIXME invalidate all steps of all objects as well?
